@@ -12,7 +12,7 @@ print(f"\nTổng samples: {len(df)} | Normal: {(df.label==0).sum()} | Anomaly: {
 
 fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
-fig.suptitle('Data Exploration – SHT31 Sensor', fontsize=14)
+fig.suptitle('Data Exploration – DHT22 Sensor', fontsize=14)
 
 # Temperature timeline
 
