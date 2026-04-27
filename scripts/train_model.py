@@ -1,0 +1,157 @@
+import pandas as pd
+import numpy as np
+import json, os
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix
+import tensorflow as tf
+from tensorflow import keras
+
+# ─────────────────────────────────────────
+# 0. Load & chuẩn bị data
+# ─────────────────────────────────────────
+df = pd.read_csv('data/raw.csv').dropna()
+features = ['temperature', 'humidity']
+X = df[features].values
+y = df['label'].values            # 0=normal, 1=anomaly
+
+X_normal  = X[y == 0]
+X_anomaly = X[y == 1]
+
+print(f"Normal: {len(X_normal)} | Anomaly: {len(X_anomaly)}")
+
+# ─────────────────────────────────────────
+# 1. Normalize (quan trọng cho inference sau này)
+# ─────────────────────────────────────────
+scaler = StandardScaler()
+scaler.fit(X_normal)              # Fit chỉ trên normal data
+X_scaled        = scaler.transform(X)
+X_normal_scaled = scaler.transform(X_normal)
+
+# Lưu scaler params (dùng lại trong C++)
+scaler_params = {
+    'mean': scaler.mean_.tolist(),
+    'scale': scaler.scale_.tolist(),
+    'features': features
+}
+with open('model/scaler_params.json', 'w') as f:
+    json.dump(scaler_params, f, indent=2)
+print("✅ Scaler params saved → model/scaler_params.json")
+
+# ─────────────────────────────────────────
+# 2. Isolation Forest (nhanh, không cần GPU)
+# ─────────────────────────────────────────
+print("\n--- Training Isolation Forest ---")
+iso = IsolationForest(n_estimators=100, contamination=0.1, random_state=42)
+iso.fit(X_normal_scaled)
+
+iso_pred_raw = iso.predict(X_scaled)          # +1=normal, -1=anomaly
+iso_pred     = (iso_pred_raw == -1).astype(int)
+
+print("\n[Isolation Forest] Classification Report:")
+print(classification_report(y, iso_pred, target_names=['Normal', 'Anomaly']))
+
+# Lưu threshold từ IF score
+iso_scores = iso.score_samples(X_normal_scaled)
+iso_threshold = float(np.percentile(iso_scores, 5))  # 5th percentile của normal
+scaler_params['iso_threshold'] = iso_threshold
+
+# ─────────────────────────────────────────
+# 3. Autoencoder (model chính → export TFLite)
+# ─────────────────────────────────────────
+print("\n--- Training Autoencoder ---")
+
+INPUT_DIM = 2
+LATENT_DIM = 8
+
+# Build model
+inputs = keras.Input(shape=(INPUT_DIM,), name='input')
+x = keras.layers.Dense(16, activation='relu')(inputs)
+x = keras.layers.Dense(LATENT_DIM, activation='relu', name='bottleneck')(x)
+x = keras.layers.Dense(16, activation='relu')(x)
+outputs = keras.layers.Dense(INPUT_DIM, name='output')(x)
+
+autoencoder = keras.Model(inputs, outputs, name='anomaly_autoencoder')
+autoencoder.compile(optimizer='adam', loss='mse')
+autoencoder.summary()
+
+# Train chỉ trên normal data
+history = autoencoder.fit(
+    X_normal_scaled, X_normal_scaled,
+    epochs=100,
+    batch_size=32,
+    validation_split=0.1,
+    callbacks=[
+        keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True),
+        keras.callbacks.ReduceLROnPlateau(patience=5, factor=0.5)
+    ],
+    verbose=1
+)
+
+# Tính reconstruction error threshold
+normal_recon = autoencoder.predict(X_normal_scaled)
+normal_mse   = np.mean(np.power(X_normal_scaled - normal_recon, 2), axis=1)
+threshold    = float(np.percentile(normal_mse, 95))  # 95th percentile
+print(f"\n✅ Reconstruction threshold: {threshold:.6f}")
+
+# Evaluate trên full dataset
+all_recon = autoencoder.predict(X_scaled)
+all_mse   = np.mean(np.power(X_scaled - all_recon, 2), axis=1)
+ae_pred   = (all_mse > threshold).astype(int)
+
+print("\n[Autoencoder] Classification Report:")
+print(classification_report(y, ae_pred, target_names=['Normal', 'Anomaly']))
+print("Confusion Matrix:")
+print(confusion_matrix(y, ae_pred))
+
+# Lưu threshold vào params
+scaler_params['ae_threshold'] = threshold
+with open('model/scaler_params.json', 'w') as f:
+    json.dump(scaler_params, f, indent=2)
+
+# ─────────────────────────────────────────
+# 4. Export sang TFLite
+# ─────────────────────────────────────────
+print("\n--- Exporting TFLite ---")
+
+# SavedModel trước
+autoencoder.save('model/autoencoder.keras')
+
+# Convert sang TFLite (full-precision)
+converter = tf.lite.TFLiteConverter.from_keras_model(autoencoder)
+tflite_model = converter.convert()
+with open('model/autoencoder.tflite', 'wb') as f:
+    f.write(tflite_model)
+print(f"✅ TFLite model saved → model/autoencoder.tflite")
+print(f"   Size: {len(tflite_model)/1024:.1f} KB")
+
+# ─────────────────────────────────────────
+# 5. Quick sanity check TFLite
+# ─────────────────────────────────────────
+print("\n--- Sanity check TFLite inference ---")
+interpreter = tf.lite.Interpreter(model_path='model/autoencoder.tflite')
+interpreter.allocate_tensors()
+
+input_idx  = interpreter.get_input_details()[0]['index']
+output_idx = interpreter.get_output_details()[0]['index']
+
+# Test 1 sample normal
+sample = X_normal_scaled[:1].astype(np.float32)
+interpreter.set_tensor(input_idx, sample)
+interpreter.invoke()
+recon  = interpreter.get_tensor(output_idx)
+mse    = float(np.mean((sample - recon) ** 2))
+print(f"Normal sample   → MSE: {mse:.6f} | {'NORMAL ✅' if mse <= threshold else 'ANOMALY ❌'}")
+
+# Test 1 sample anomaly (nếu có)
+if len(X_anomaly) > 0:
+    sample_a = scaler.transform(X_anomaly[:1]).astype(np.float32)
+    interpreter.set_tensor(input_idx, sample_a)
+    interpreter.invoke()
+    recon_a = interpreter.get_tensor(output_idx)
+    mse_a   = float(np.mean((sample_a - recon_a) ** 2))
+    print(f"Anomaly sample  → MSE: {mse_a:.6f} | {'ANOMALY ✅' if mse_a > threshold else 'NORMAL ❌'}")
+
+print("\n🎉 Training hoàn tất! Files trong model/:")
+os.system("ls -lh model/")
+
